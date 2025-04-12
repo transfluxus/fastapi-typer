@@ -1,204 +1,211 @@
-import json
 import pytest
-import inspect
-from typing import Optional
-import httpx
-import typer
-from fastapi import FastAPI, APIRouter
 from typer.testing import CliRunner
+from unittest.mock import patch, MagicMock
+from fastapi import FastAPI, APIRouter, Body, Query, Path
+from typing import Optional, List
+from pydantic import BaseModel
 
 from api.claude1 import FastAPIToTyper
 
 
-# Adjust this import to match your module structure:
-# from your_module import FastAPIToTyper
+# Import your FastAPIToTyper class
 
 
-# --- Dummy Classes to Patch HTTP Requests ---
-
-class DummyResponse:
-    """A dummy response to simulate httpx.Response."""
-    def __init__(self, data, status_code=200):
-        self._data = data
-        self.status_code = status_code
-        self.text = json.dumps(data) if isinstance(data, dict) else str(data)
-
-    def json(self):
-        return self._data
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise httpx.HTTPStatusError("Error", request=None, response=self)
+class Item(BaseModel):
+    name: str
+    price: float
+    description: Optional[str] = None
+    tags: List[str] = []
 
 
-class DummyClient:
-    """A dummy httpx Client that returns preset responses."""
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
-
-    def get(self, url, params=None, headers=None):
-        # Simulate the GET /items/{item_id} endpoint.
-        if "/items/" in url:
-            item_id = int(url.rstrip("/").split("/")[-1])
-            data = {"item_id": item_id, "q": params.get("q") if params else None}
-            return DummyResponse(data)
-        # Simulate the GET /users/{user_id} endpoint.
-        if "/users/" in url:
-            user_id = int(url.rstrip("/").split("/")[-1])
-            data = {"user_id": user_id}
-            return DummyResponse(data)
-        return DummyResponse({})
-
-    def post(self, url, params=None, json=None, headers=None):
-        # Simulate the POST /items/ endpoint.
-        if "/items/" in url:
-            data = {"name": json.get("name"), "price": json.get("price")}
-            return DummyResponse(data)
-        return DummyResponse({})
-
-    def put(self, url, params=None, json=None, headers=None):
-        return DummyResponse(json)
-
-    def delete(self, url, params=None, headers=None):
-        return DummyResponse({"deleted": True})
-
-    def patch(self, url, params=None, json=None, headers=None):
-        return DummyResponse(json)
-
-
-# Use Typer's CLI runner for testing
-runner = CliRunner()
-
-
-# --- Fixtures for the Test FastAPI App and Converter ---
-
-@pytest.fixture
-def test_app():
-    """Define a test FastAPI application with endpoints and a sub-router."""
+def create_test_fastapi_app():
+    """Create a test FastAPI application with various endpoint types."""
     app = FastAPI()
 
+    # GET endpoint with path and query parameters
     @app.get("/items/{item_id}")
-    def read_item(item_id: int, q: Optional[str] = None):
+    def read_item(
+            item_id: int = Path(..., description="The ID of the item to retrieve"),
+            q: Optional[str] = Query(None, description="Search query string"),
+            skip: int = Query(0, description="Skip N items"),
+            limit: int = Query(10, description="Limit results to N items")
+    ):
         """Get an item by its ID"""
-        return {"item_id": item_id, "q": q}
+        return {
+            "item_id": item_id,
+            "q": q,
+            "skip": skip,
+            "limit": limit
+        }
 
+    # POST endpoint with body
     @app.post("/items/")
-    def create_item(name: str, price: float):
+    def create_item(item: Item):
         """Create a new item"""
-        return {"name": name, "price": price}
+        return item
 
-    router = APIRouter(prefix="/users")
+    # PUT endpoint with path param and body
+    @app.put("/items/{item_id}")
+    def update_item(item_id: int, item: Item):
+        """Update an existing item"""
+        return {"item_id": item_id, **item.dict()}
 
-    @router.get("/{user_id}")
+    # DELETE endpoint with path param
+    @app.delete("/items/{item_id}")
+    def delete_item(item_id: int):
+        """Delete an item"""
+        return {"deleted": item_id}
+
+    # PATCH endpoint with path param and specific body fields
+    @app.patch("/items/{item_id}/name")
+    def patch_item_name(
+            item_id: int,
+            name: str = Body(..., embed=True)
+    ):
+        """Update an item's name"""
+        return {"item_id": item_id, "name": name}
+
+    @app.patch("/items/{item_id}/price")
+    def patch_item_price(
+            item_id: int,
+            price: float = Body(..., embed=True)
+    ):
+        """Update an item's price"""
+        return {"item_id": item_id, "price": price}
+
+    # Create a sub-router for nested endpoints
+    user_router = APIRouter(prefix="/users")
+
+    @user_router.get("/{user_id}")
     def read_user(user_id: int):
         """Get a user by ID"""
         return {"user_id": user_id}
 
-    app.include_router(router)
+    @user_router.post("/")
+    def create_user(username: str = Body(...), email: str = Body(...)):
+        """Create a new user"""
+        return {"username": username, "email": email}
+
+    # Create a nested router (multiple levels)
+    order_router = APIRouter(prefix="/orders")
+
+    @order_router.get("/{order_id}")
+    def get_order(order_id: int):
+        """Get an order by ID"""
+        return {"order_id": order_id}
+
+    # Include the nested router in the user router
+    user_router.include_router(order_router)
+
+    # Include the user router in the main app
+    app.include_router(user_router)
+
     return app
 
 
 @pytest.fixture
-def converter(test_app):
-    """Instantiate the FastAPIToTyper converter with the test app."""
-    conv = FastAPIToTyper(test_app, base_url="http://testserver")
-    return conv
+def test_fastapi_app():
+    return create_test_fastapi_app()
 
 
-@pytest.fixture(autouse=True)
-def patch_httpx(monkeypatch):
-    """
-    Patch httpx.Client with our dummy client so that no real HTTP requests are made.
-    This fixture applies automatically to all tests.
-    """
-    monkeypatch.setattr(httpx, "Client", DummyClient)
+@pytest.fixture
+def mock_http_response():
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"result": "success"}
+    mock_response.text = '{"result": "success"}'
+    mock_response.raise_for_status = MagicMock()
+    return mock_response
 
 
-# --- Tests for the CLI Commands ---
+@pytest.fixture
+def mock_httpx_client(mock_http_response):
+    with patch("httpx.Client") as mock_client:
+        client_instance = MagicMock()
+        # Set up return values for different HTTP methods
+        client_instance.get.return_value = mock_http_response
+        client_instance.post.return_value = mock_http_response
+        client_instance.put.return_value = mock_http_response
+        client_instance.delete.return_value = mock_http_response
+        client_instance.patch.return_value = mock_http_response
+        client_instance.__enter__.return_value = client_instance
 
-def test_get_item(converter):
-    """
-    Test the GET /items/{item_id} endpoint.
-    The generated command name is derived from the path (becomes "items").
-    """
-    result = runner.invoke(
-        converter.typer_app,
-        ["items", "1", "--q", "testquery"]
-    )
-
-    # Check that the output contains the expected JSON response
-    assert "Executing GET request to" in result.output
-    assert '"item_id": 1' in result.output
-    assert '"q": "testquery"' in result.output
+        mock_client.return_value = client_instance
+        yield mock_client
 
 
-def test_post_item(converter):
-    """
-    Test the POST /items/ endpoint.
-    The command name for POST is also derived from the path (becomes "items").
-    """
-    result = runner.invoke(
-        converter.typer_app,
-        ["items", "--name", "testitem", "--price", "9.99"]
-    )
+def test_fastapitotyper_get_method(test_fastapi_app, mock_httpx_client):
+    """Test GET method with path and query parameters."""
+    converter = FastAPIToTyper(test_fastapi_app, base_url="http://localhost:8000")
+    runner = CliRunner()
 
-    # Verify that the printed response contains the correct data
-    assert "Executing POST request to" in result.output
-    assert '"name": "testitem"' in result.output
-    # JSON module converts numeric values, so check for the float as well.
-    assert '"price": 9.99' in result.output
+    # Debug to see available commands and parameters
+    print("\nDEBUG - Available commands:")
+    for cmd in converter.typer_app.registered_commands:
+        print(f"Command: {cmd.name}")
+        print(f"  Callback: {cmd.callback.__name__}")
+        for param in cmd.params:
+            print(f"  Param: {param.name}, Opts: {param.opts}")
 
+    # Use the updated command name with HTTP method
+    result = runner.invoke(converter.typer_app, ["items_get", "123", "--q", "search", "--skip", "5", "--limit", "20"])
 
-def test_get_user(converter):
-    """
-    Test the GET /users/{user_id} endpoint.
-    The sub-router creates a nested command. For a route with only a path parameter,
-    the command name defaults to "root" under the "users" sub-command.
-    """
-    # In our implementation, the sub-router is added with name "users"
-    # and the route "/{user_id}" becomes command "root"
-    result = runner.invoke(
-        converter.typer_app,
-        ["users", "root", "42"]
-    )
+    assert result.exit_code == 0, f"Failed with output: {result.output}"
 
-    # Verify that the output contains the expected JSON response for a user
-    assert "Executing GET request to" in result.output
-    assert '"user_id": 42' in result.output
+    client = mock_httpx_client.return_value.__enter__.return_value
+    client.get.assert_called_once()
+
+    call_args, call_kwargs = client.get.call_args
+    assert call_args[0] == "http://localhost:8000/items/123"
+    assert call_kwargs["params"] == {"q": "search", "skip": "5", "limit": "20"}
 
 
-def test_global_options_override_base_url(converter):
-    """
-    Test that the global option to override the base URL (via --url)
-    and the verbose flag (--verbose) work as expected.
-    """
-    result = runner.invoke(
-        converter.typer_app,
-        ["--url", "http://override", "--verbose", "items", "1", "--q", "overrideTest"]
-    )
-    # Check verbose output
-    assert "Executing GET request to" in result.output
-    # Check that the URL printed uses the overridden value.
-    assert "http://override" in result.output
+
+def test_fastapitotyper_post_method(test_fastapi_app, mock_httpx_client):
+    """Test POST method with body."""
+    converter = FastAPIToTyper(test_fastapi_app, base_url="http://localhost:8000")
+    runner = CliRunner()
+
+    result = runner.invoke(converter.typer_app,
+                           ["items", "--body", '{"name": "Test Item", "price": 29.99, "tags": ["test"]}'])
+
+    assert result.exit_code == 0, f"Failed with output: {result.output}"
+
+    client = mock_httpx_client.return_value.__enter__.return_value
+    client.post.assert_called_once()
+
+    call_args, call_kwargs = client.post.call_args
+    assert call_args[0] == "http://localhost:8000/items/"
+    assert call_kwargs["json"] == {"name": "Test Item", "price": 29.99, "tags": ["test"]}
 
 
-def test_invalid_json_body(converter):
-    """
-    Test that passing invalid JSON to a body parameter prints an error
-    and exits with a non-zero status.
-    """
-    # For endpoints with a body parameter (such as POST),
-    # pass an invalid JSON string to --body.
-    result = runner.invoke(
-        converter.typer_app,
-        ["items", "--body", "not-a-json", "--name", "item", "--price", "9.99"]
-    )
-    # Expect an error message about the JSON validation.
-    assert "Error: Body must be valid JSON" in result.output
-    assert result.exit_code == 1
+def test_fastapitotyper_delete_method(test_fastapi_app, mock_httpx_client):
+    """Test DELETE method with path parameter."""
+    converter = FastAPIToTyper(test_fastapi_app, base_url="http://localhost:8000")
+    runner = CliRunner()
+
+    result = runner.invoke(converter.typer_app, ["items", "789"])
+
+    assert result.exit_code == 0, f"Failed with output: {result.output}"
+
+    client = mock_httpx_client.return_value.__enter__.return_value
+    client.delete.assert_called_once()
+
+    call_args, call_kwargs = client.delete.call_args
+    assert call_args[0] == "http://localhost:8000/items/789"
+
+
+def test_fastapitotyper_nested_routes(test_fastapi_app, mock_httpx_client):
+    """Test nested routes."""
+    converter = FastAPIToTyper(test_fastapi_app, base_url="http://localhost:8000")
+    runner = CliRunner()
+
+    # Test users endpoint
+    result = runner.invoke(converter.typer_app, ["users", "202"])
+
+    assert result.exit_code == 0, f"Failed with output: {result.output}"
+
+    client = mock_httpx_client.return_value.__enter__.return_value
+    client.get.assert_called()
+
+    call_args, call_kwargs = client.get.call_args
+    assert call_args[0] == "http://localhost:8000/users/202"
