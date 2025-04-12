@@ -12,6 +12,97 @@ from fastapi.routing import APIRoute
 from pathlib import Path as PathLib
 
 
+def _extract_app_info(self) -> Dict[str, Any]:
+    """Extract basic information about the FastAPI app."""
+    if not self.openapi_schema:
+        return {}
+
+    info = self.openapi_schema.get('info', {})
+    return {
+        'title': info.get('title', 'FastAPI App'),
+        'description': info.get('description', ''),
+        'version': info.get('version', '0.1.0'),
+        'terms_of_service': info.get('termsOfService', ''),
+        'contact': info.get('contact', {}),
+        'license': info.get('license', {})
+    }
+
+
+def _extract_route_metadata(self) -> Dict[str, Dict[str, Any]]:
+    """Extract metadata for all routes from the OpenAPI schema."""
+    if not self.openapi_schema:
+        return {}
+
+    paths = self.openapi_schema.get('paths', {})
+    route_metadata = {}
+
+    # Extract metadata for each path and method
+    for path, methods in paths.items():
+        for method, details in methods.items():
+            if method.lower() == 'parameters':
+                continue  # Skip common parameters
+
+            route_key = f"{method.upper()}:{path}"
+
+            # Extract parameter metadata
+            params_metadata = {}
+            parameters = details.get('parameters', [])
+            for param in parameters:
+                param_name = param.get('name')
+                if param_name:
+                    params_metadata[param_name] = {
+                        'description': param.get('description', ''),
+                        'required': param.get('required', False),
+                        'schema': param.get('schema', {}),
+                        'examples': param.get('examples', {}),
+                        'example': param.get('example', None),
+                        'location': param.get('in', 'query')  # query, path, header, cookie
+                    }
+
+            # Extract request body metadata
+            body_metadata = {}
+            request_body = details.get('requestBody', {})
+            if request_body:
+                content = request_body.get('content', {})
+                # Usually application/json, but could be others
+                for content_type, content_schema in content.items():
+                    body_metadata[content_type] = {
+                        'schema': content_schema.get('schema', {}),
+                        'examples': content_schema.get('examples', {}),
+                        'example': content_schema.get('example', None)
+                    }
+
+            # Store all metadata for this route
+            route_metadata[route_key] = {
+                'summary': details.get('summary', ''),
+                'description': details.get('description', ''),
+                'operationId': details.get('operationId', ''),
+                'parameters': params_metadata,
+                'requestBody': body_metadata,
+                'responses': details.get('responses', {}),
+                'tags': details.get('tags', []),
+                'deprecated': details.get('deprecated', False)
+            }
+
+    return route_metadataimport
+    typer
+
+
+import inspect
+import functools
+import importlib
+import re
+from typing import Any, Dict, List, Optional, Type, get_type_hints, Callable, Union, Set
+import httpx
+import json
+from pydantic import BaseModel
+from fastapi import FastAPI, APIRouter, Query, Path, Body
+from fastapi.routing import APIRoute
+from pathlib import Path as PathLib
+from enum import Enum
+import yaml  # for OpenAPI schema parsing
+
+
 class FastAPIToTyper:
     """Converts a FastAPI application to a Typer CLI application."""
 
@@ -19,8 +110,9 @@ class FastAPIToTyper:
             self,
             app: Union[FastAPI, str],
             base_url: Optional[str] = None,
-            app_name: str = "FastAPI CLI",
-            app_description: str = "CLI generated from FastAPI application"
+            app_name: str = None,
+            app_description: str = None,
+            extract_metadata: bool = True
     ):
         """
         Initialize the converter.
@@ -28,21 +120,34 @@ class FastAPIToTyper:
         Args:
             app: Either a FastAPI instance or a string with the import path (e.g. 'myapp.main:app')
             base_url: Base URL for the API when making actual requests
-            app_name: Name of the generated CLI application
-            app_description: Description of the generated CLI application
+            app_name: Name of the generated CLI application (defaults to FastAPI app title)
+            app_description: Description of the generated CLI application (defaults to FastAPI app description)
+            extract_metadata: Whether to extract metadata from OpenAPI schema
         """
-        self.typer_app = typer.Typer(help=app_description)
-        self.base_url = base_url
-        self.app_name = app_name
-        self.verbose = False
-
         # Import the app if a string is provided
         if isinstance(app, str):
-            module_path, app_name = app.split(':')
+            module_path, app_name_str = app.split(':')
             module = importlib.import_module(module_path)
-            self.fastapi_app = getattr(module, app_name)
+            self.fastapi_app = getattr(module, app_name_str)
         else:
             self.fastapi_app = app
+
+        # Extract metadata from the FastAPI app
+        self.openapi_schema = self.fastapi_app.openapi() if extract_metadata else None
+        self.app_info = self._extract_app_info()
+
+        # Set app name and description based on FastAPI app if not provided
+        self.app_name = app_name or self.app_info.get('title', 'FastAPI CLI')
+        self.app_description = app_description or self.app_info.get('description',
+                                                                    'CLI generated from FastAPI application')
+
+        # Create the Typer app
+        self.typer_app = typer.Typer(help=self.app_description)
+        self.base_url = base_url
+        self.verbose = False
+
+        # Extract route metadata
+        self.route_metadata = self._extract_route_metadata() if extract_metadata else {}
 
         # Add global options
         self._add_global_options()
@@ -52,16 +157,59 @@ class FastAPIToTyper:
 
     def _add_global_options(self):
         """Add global options to the CLI application."""
+        # Add more detailed help if we have app info
+        app_help = self.app_description
+        if self.app_info:
+            version = self.app_info.get('version', '')
+            contact = self.app_info.get('contact', {})
+            license_info = self.app_info.get('license', {})
 
-        @self.typer_app.callback()
+            if version:
+                app_help += f"\n\nVersion: {version}"
+
+            if contact:
+                contact_str = []
+                if 'name' in contact:
+                    contact_str.append(contact['name'])
+                if 'email' in contact:
+                    contact_str.append(f"<{contact['email']}>")
+                if 'url' in contact:
+                    contact_str.append(f"({contact['url']})")
+
+                if contact_str:
+                    app_help += f"\n\nContact: {' '.join(contact_str)}"
+
+            if license_info:
+                if 'name' in license_info:
+                    app_help += f"\n\nLicense: {license_info['name']}"
+                    if 'url' in license_info:
+                        app_help += f" ({license_info['url']})"
+
+        @self.typer_app.callback(help=app_help)
         def global_options(
                 url: str = typer.Option(None, "--url", "-u", help="Override base URL for API requests"),
-                verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose output")
+                verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose output"),
+                format: str = typer.Option("json", "--format", "-f",
+                                           help="Output format (json, yaml, table)",
+                                           choices=["json", "yaml", "table"]),
+                timeout: float = typer.Option(30.0, "--timeout", "-t",
+                                              help="Request timeout in seconds"),
+                version: bool = typer.Option(False, "--version", help="Show version and exit")
         ):
             """Global options for the CLI."""
+            if version:
+                version_text = f"{self.app_name} "
+                if self.app_info and self.app_info.get('version'):
+                    version_text += f"v{self.app_info['version']}"
+                typer.echo(version_text)
+                raise typer.Exit()
+
             if url:
                 self.base_url = url
+
             self.verbose = verbose
+            self.output_format = format
+            self.timeout = timeout
 
     def _build_cli(self):
         """Build the CLI structure from FastAPI routes."""
@@ -69,20 +217,68 @@ class FastAPIToTyper:
 
     def _process_routes(self, routes, current_typer_app, path_prefix):
         """Process routes recursively and add them to the appropriate Typer app."""
+        # Group routes by tags for better organization
+        tagged_routes = {}
+        untagged_routes = []
+
         for route in routes:
             if isinstance(route, APIRouter):
                 # Create a sub-app for each router
-                sub_app = typer.Typer(help=f"Commands for {route.prefix}")
+                router_name = route.prefix.strip('/').replace('-', '_') if route.prefix else "root"
+
+                # Extract router metadata if available
+                router_description = f"Commands for {route.prefix}" if route.prefix else "Root commands"
+                if hasattr(route, 'tags') and route.tags:
+                    if isinstance(route.tags[0], dict) and 'description' in route.tags[0]:
+                        router_description = route.tags[0]['description']
+                    elif isinstance(route.tags[0], str):
+                        router_description = f"Commands for {route.tags[0]}"
+
+                sub_app = typer.Typer(help=router_description)
                 current_typer_app.add_typer(
                     sub_app,
-                    name=route.prefix.strip('/').replace('-', '_')
+                    name=router_name
                 )
-                new_prefix = path_prefix + [route.prefix.strip('/')]
+                new_prefix = path_prefix + [router_name]
                 self._process_routes(route.routes, sub_app, new_prefix)
 
             elif isinstance(route, APIRoute):
-                # Process individual route
-                self._add_route_to_typer(route, current_typer_app, path_prefix)
+                # Check if route has tags in OpenAPI schema
+                http_method = list(route.methods)[0] if route.methods else "GET"
+                route_key = f"{http_method}:{route.path}"
+                route_meta = self.route_metadata.get(route_key, {})
+                tags = route_meta.get('tags', [])
+
+                if tags:
+                    # Add to tagged routes
+                    for tag in tags:
+                        if tag not in tagged_routes:
+                            tagged_routes[tag] = []
+                        tagged_routes[tag].append(route)
+                else:
+                    # Add to untagged routes
+                    untagged_routes.append(route)
+
+        # Process tagged routes first - create a sub-app for each tag
+        for tag, tag_routes in tagged_routes.items():
+            # Find tag description if available in OpenAPI schema
+            tag_description = f"Commands for {tag}"
+            if self.openapi_schema and 'tags' in self.openapi_schema:
+                for tag_info in self.openapi_schema['tags']:
+                    if tag_info.get('name') == tag:
+                        tag_description = tag_info.get('description', tag_description)
+                        break
+
+            tag_app = typer.Typer(help=tag_description)
+            current_typer_app.add_typer(tag_app, name=tag.lower().replace(' ', '_'))
+
+            # Add routes to tag app
+            for route in tag_routes:
+                self._add_route_to_typer(route, tag_app, path_prefix + [tag])
+
+        # Process untagged routes
+        for route in untagged_routes:
+            self._add_route_to_typer(route, current_typer_app, path_prefix)
 
     def _add_route_to_typer(self, route: APIRoute, typer_app, path_prefix):
         """Convert a FastAPI route to a Typer command."""
@@ -90,6 +286,10 @@ class FastAPIToTyper:
         path = route.path
         http_method = list(route.methods)[0] if route.methods else "GET"
         endpoint_func = route.endpoint
+
+        # Get route metadata from OpenAPI schema
+        route_key = f"{http_method}:{path}"
+        route_meta = self.route_metadata.get(route_key, {})
 
         # Get function signature and type hints
         try:
@@ -102,16 +302,34 @@ class FastAPIToTyper:
         # Generate a command name from the path
         command_name = self._path_to_command_name(path)
 
+        # Get rich description from OpenAPI metadata
+        summary = route_meta.get('summary', '')
+        description = route_meta.get('description', '')
+
+        # Use summary and/or description for the command help text
+        help_text = None
+        if summary and description:
+            help_text = f"{summary}\n\n{description}"
+        elif summary:
+            help_text = summary
+        elif description:
+            help_text = description
+
         # Create a CLI command function with appropriate parameters
-        cli_command = self._create_cli_command(endpoint_func, route, type_hints)
+        cli_command = self._create_cli_command(endpoint_func, route, type_hints, route_meta)
 
         # Register the command with Typer
-        typer_app.command(name=command_name)(cli_command)
+        typer_app.command(name=command_name, help=help_text)(cli_command)
 
-    def _create_cli_command(self, endpoint_func, route, type_hints):
+    def _create_cli_command(self, endpoint_func, route, type_hints, route_meta=None):
         """Create a Typer command function from a FastAPI endpoint."""
         signature = inspect.signature(endpoint_func)
         parameters = []
+
+        # Extract parameters metadata from route_meta
+        param_metadata = {}
+        if route_meta:
+            param_metadata = route_meta.get('parameters', {})
 
         # Process each parameter from the original function
         for name, param in signature.parameters.items():
@@ -123,6 +341,16 @@ class FastAPIToTyper:
             if annotation is inspect.Parameter.empty:
                 annotation = str
 
+            # Get parameter metadata
+            param_meta = param_metadata.get(name, {})
+            param_description = param_meta.get('description', f"Parameter {name}")
+            param_example = param_meta.get('example', None)
+
+            # Format help text with example if available
+            help_text = param_description
+            if param_example is not None:
+                help_text = f"{param_description} (example: {param_example})"
+
             # Determine parameter type (path, query, or body)
             is_path_param = f"{{{name}}}" in route.path
 
@@ -131,15 +359,23 @@ class FastAPIToTyper:
                 new_param = inspect.Parameter(
                     name,
                     kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    default=typer.Argument(..., help=f"Path parameter {name}"),
+                    default=typer.Argument(..., help=help_text),
                     annotation=annotation
                 )
             elif self._is_body_parameter(param):
                 # Body parameters become JSON string options
+                body_meta = route_meta.get('requestBody', {}) if route_meta else {}
+                json_meta = body_meta.get('application/json', {}) if body_meta else {}
+                body_example = json_meta.get('example', None)
+
+                body_help = "Request body as JSON string"
+                if body_example is not None:
+                    body_help = f"{body_help} (example: {json.dumps(body_example)})"
+
                 new_param = inspect.Parameter(
                     "body",
                     kind=inspect.Parameter.KEYWORD_ONLY,
-                    default=typer.Option(None, "--body", "-b", help="Request body as JSON string"),
+                    default=typer.Option(None, "--body", "-b", help=body_help),
                     annotation=str
                 )
             else:
@@ -147,6 +383,13 @@ class FastAPIToTyper:
                 default_value = param.default if param.default is not inspect.Parameter.empty else None
                 required = param.default is inspect.Parameter.empty
 
+                # If the parameter has an enum schema, add choices
+                choices = None
+                schema = param_meta.get('schema', {})
+                if schema and schema.get('enum') and isinstance(schema['enum'], list):
+                    choices = schema['enum']
+
+                # Create option with appropriate help text and possible choices
                 new_param = inspect.Parameter(
                     name,
                     kind=inspect.Parameter.KEYWORD_ONLY,
@@ -154,7 +397,9 @@ class FastAPIToTyper:
                         default_value if not required else ...,
                         f"--{name}",
                         f"-{name[0]}",
-                        help=f"Query parameter {name}"
+                        help=help_text,
+                        # Include choices if available
+                        **({'choices': choices} if choices else {})
                     ),
                     annotation=annotation
                 )
@@ -288,7 +533,16 @@ class FastAPIToTyper:
         # Remove trailing underscores
         path = path.rstrip('_')
 
-        return path or "root"
+        # For empty path, use "root"
+        if not path:
+            return "root"
+
+        # Camel case the command for readability if it contains underscores
+        if '_' in path:
+            words = path.split('_')
+            path = words[0] + ''.join(word.capitalize() for word in words[1:])
+
+        return path
 
     def _is_body_parameter(self, param) -> bool:
         """Check if a parameter is a request body."""
@@ -377,6 +631,7 @@ if __name__ == "__main__":
 
     # Create a sub-router
     router = APIRouter(prefix="/users")
+
 
     @router.get("/{user_id}")
     def read_user(user_id: int):
