@@ -99,8 +99,13 @@ class FastAPIToTyper:
             # Skip if we can't inspect the function
             return
 
-        # Generate a command name from the path
-        command_name = self._path_to_command_name(path)
+        # Generate a command name from the path AND HTTP method
+        base_command_name = self._path_to_command_name(path)
+        command_name = f"{base_command_name}_{http_method.lower()}"
+
+        # Print debug info
+        print(f"Registering command: {command_name} for {http_method} {path}")
+        print(f"Endpoint: {endpoint_func.__name__}")
 
         # Create a CLI command function with appropriate parameters
         cli_command = self._create_cli_command(endpoint_func, route, type_hints)
@@ -112,6 +117,9 @@ class FastAPIToTyper:
         """Create a Typer command function from a FastAPI endpoint."""
         signature = inspect.signature(endpoint_func)
         parameters = []
+
+        # Track if we've already added a body parameter
+        body_added = False
 
         # Process each parameter from the original function
         for name, param in signature.parameters.items():
@@ -134,14 +142,19 @@ class FastAPIToTyper:
                     default=typer.Argument(..., help=f"Path parameter {name}"),
                     annotation=annotation
                 )
+                parameters.append(new_param)
             elif self._is_body_parameter(param):
-                # Body parameters become JSON string options
-                new_param = inspect.Parameter(
-                    "body",
-                    kind=inspect.Parameter.KEYWORD_ONLY,
-                    default=typer.Option(None, "--body", "-b", help="Request body as JSON string"),
-                    annotation=str
-                )
+                # Only add a body parameter if we haven't added one yet
+                if not body_added:
+                    new_param = inspect.Parameter(
+                        "body",
+                        kind=inspect.Parameter.KEYWORD_ONLY,
+                        default=typer.Option(None, "--body", "-b", help="Request body as JSON string"),
+                        annotation=str
+                    )
+                    parameters.append(new_param)
+                    body_added = True
+                # If we've already added a body parameter, skip this one
             else:
                 # Query parameters become options
                 default_value = param.default if param.default is not inspect.Parameter.empty else None
@@ -158,8 +171,7 @@ class FastAPIToTyper:
                     ),
                     annotation=annotation
                 )
-
-            parameters.append(new_param)
+                parameters.append(new_param)
 
         # Create a new signature with our modified parameters
         new_signature = inspect.Signature(parameters, return_annotation=None)
@@ -178,20 +190,21 @@ class FastAPIToTyper:
             body_data = None
 
             # Process positional arguments (path parameters)
-            for i, (name, _) in enumerate([p for p in parameters if p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD]):
+            path_param_names = [p.name for p in parameters if p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD]
+            for i, name in enumerate(path_param_names):
                 if i < len(args):
                     path_params[name] = args[i]
 
             # Process keyword arguments
             for name, value in kwargs.items():
-                if f"{{{name}}}" in path:
-                    path_params[name] = value
-                elif name == "body" and value is not None:
+                if name == "body" and value is not None:
                     try:
                         body_data = json.loads(value)
                     except json.JSONDecodeError:
                         typer.echo(f"Error: Body must be valid JSON", err=True)
                         raise typer.Exit(code=1)
+                elif f"{{{name}}}" in path:
+                    path_params[name] = value
                 else:
                     query_params[name] = value
 
@@ -263,6 +276,7 @@ class FastAPIToTyper:
         cli_command.__doc__ = endpoint_func.__doc__ or f"{http_method} {path}"
 
         return cli_command
+
 
     def _build_url(self, path: str, path_params: Dict[str, Any]) -> str:
         """Build the URL with path parameters substituted."""
